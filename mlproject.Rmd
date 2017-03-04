@@ -1,0 +1,246 @@
+---
+title: "Practical Machine Learning Project"
+author: "Manuel Ventero"
+date: "2 March 2017"
+output: html_document
+---
+# Introduction
+
+Using devices such as Jawbone Up, Nike FuelBand, and Fitbit it is now possible to collect a large amount of data about personal activity relatively inexpensively. These type of devices are part of the quantified self movement - a group of enthusiasts who take measurements about themselves regularly to improve their health, to find patterns in their behavior, or because they are tech geeks. One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it. In this project, your goal will be to use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants. They were asked to perform barbell lifts correctly and incorrectly in 5 different ways. More information is available from the website here: [http://groupware.les.inf.puc-rio.br/har]http://groupware.les.inf.puc-rio.br/har (see the section on the Weight Lifting Exercise Dataset).
+
+# Data processing
+
+```{r load data, cache=TRUE, warning=FALSE, message=FALSE, error=FALSE}
+library(RCurl)
+library(xgboost)  
+library(dplyr)
+library(caret)
+library(reshape2)
+library(ggplot2)
+
+
+if (!file.exists("./data")) {
+  dir.create("./data")
+}
+if (!file.exists("./data/pml-training.csv")) {
+  url.training <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+  download.file(url.training, destfile = "./data/pml-training.csv")
+}
+
+if (!file.exists("./data/pml-testing.csv")) {
+  url.testing <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+  download.file(url.testing, destfile = "./data/pml-testing.csv")
+}
+
+train <- read.csv("data/pml-training.csv")
+test <- read.csv("data/pml-testing.csv")
+dim(train); dim(test)
+```
+
+## Preprocessing
+
+Multiple preprocessing techniques have been applied on the data.
+
+First, variables with near zero variance were removed. Right after that, variables with more than 75% percent
+pearson correlation, we also removed.
+
+No linear combinations of variables were found.
+
+```{r nzv filter, cache=TRUE, warning=FALSE, message=FALSE, error=FALSE}
+set.seed(12345) 
+
+x <- train[,-c(160)]
+y <- train[,c(160)]
+
+xNonNumeric <- grepl("^X|timestamp|window", names(x))
+x <- x[, !xNonNumeric]
+
+nzv <- nearZeroVar(x)
+xnzv <- x[, -nzv]
+
+xnarep <- xnzv[, colSums(is.na(xnzv)) == 0] 
+xnarep <- xnarep[, sapply(xnarep, is.numeric)]
+
+highlyCorDescr <- findCorrelation(cor(xnarep), cutoff = .75)
+xncor <- xnarep[,-highlyCorDescr]
+
+comboInfo <- findLinearCombos(xncor)
+
+if(!is.null(comboInfo$remove)){
+  print("Removing linear combos")
+  xfinal <- xncor[, -comboInfo$remove]
+}else{
+  print("no combos found")
+  xfinal <- xncor
+}
+
+cormat <- round(cor(xfinal),2)
+melted_cormat <- melt(cormat)
+
+# Get lower triangle of the correlation matrix
+get_lower_tri<-function(cormat){
+  cormat[upper.tri(cormat)] <- NA
+  return(cormat)
+}
+# Get upper triangle of the correlation matrix
+get_upper_tri <- function(cormat){
+  cormat[lower.tri(cormat)]<- NA
+  return(cormat)
+}
+  
+reorder_cormat <- function(cormat){
+  # Use correlation between variables as distance
+  dd <- as.dist((1-cormat)/2)
+  hc <- hclust(dd)
+  cormat <-cormat[hc$order, hc$order]
+}
+
+upper_tri <- get_upper_tri(cormat)
+# Melt the correlation matrix
+melted_cormat <- melt(upper_tri, na.rm = TRUE)
+# Create a ggheatmap
+ggheatmap <- ggplot(melted_cormat, aes(Var2, Var1, fill = value))+
+ geom_tile(color = "white")+
+ scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+   midpoint = 0, limit = c(-1,1), space = "Lab", 
+    name="Pearson\nCorrelation") +
+  theme_minimal()+ # minimal theme
+ theme(axis.text.x = element_text(angle = 90, vjust = 1, 
+    size = 8, hjust = 1), axis.text.y = element_text(size = 8))+
+ coord_fixed()
+# Print the heatmap
+print(ggheatmap)
+
+```
+
+## Data splitting
+```{r feature plot, cache=TRUE, warning=FALSE, message=FALSE, error=FALSE}
+colnames(xfinal)
+test_prep<- test[,colnames(xfinal)]
+test_prep <- test_prep[, colSums(is.na(test_prep)) == 0] 
+test_prep <- test_prep[, sapply(test_prep, is.numeric)]
+
+df_final <- xfinal
+df_final['y'] <- y
+
+inTrain <- createDataPartition(df_final$y, p=0.70, list=F)
+train_data <- df_final[inTrain, ]
+test_data <- df_final[-inTrain, ]
+```
+
+## Modeling
+### Model 1. Random Forest 
+```{r RF fitting, cache=TRUE, warning=FALSE, message=FALSE, error=FALSE}
+library(doMC)
+registerDoMC(cores = 4)
+
+setting <- trainControl(method="cv", 3, allowParallel = TRUE)
+
+modRF <- train(y ~ ., data=train_data, method="rf", trControl=setting, ntree=250)
+```
+
+```{r RF Validation, cache=TRUE, warning=FALSE, message=FALSE, error=FALSE}
+modRF
+modRF$finalModel
+
+classe <- predict(modRF, newdata=test_data)
+classeConfusionMatrix <- confusionMatrix(classe, test_data$y)
+classeConfusionMatrix
+
+# plot matrix results
+plot(classeConfusionMatrix$table, col = classeConfusionMatrix$byClass, 
+     main = paste("RF Accuracy =>",
+                  round(classeConfusionMatrix$overall['Accuracy'], 4)))
+```
+
+Random Forest model has a 0.9874 performance.
+
+
+### Model 2. Gradient Boosting (Xgboost package)
+```{r Xgboost, cache=TRUE, warning=FALSE, message=FALSE, error=FALSE}
+train_data_x = train_data[, -which(names(train_data) == "y")]
+train_data_y = as.character(train_data$y)
+
+train_data_y[train_data_y=='A'] <- '0'
+train_data_y[train_data_y=='B'] <- '1'
+train_data_y[train_data_y=='C'] <- '2'
+train_data_y[train_data_y=='D'] <- '3'
+train_data_y[train_data_y=='E'] <- '4'
+train_data_y = as.numeric(train_data_y)
+
+test_data_x = test_data[, -which(names(test_data) == "y")]
+test_data_y = as.character(test_data$y)
+test_data_y[test_data_y=='A'] <- '0'
+test_data_y[test_data_y=='B'] <- '1'
+test_data_y[test_data_y=='C'] <- '2'
+test_data_y[test_data_y=='D'] <- '3'
+test_data_y[test_data_y=='E'] <- '4'
+test_data_y = as.numeric(test_data_y)
+
+train_matrix <- xgb.DMatrix(as.matrix(train_data_x), label=train_data_y, missing=NaN)
+test_matrix <- xgb.DMatrix(as.matrix(test_data_x), label=test_data_y, missing=NaN)
+ 
+noClasses <- length(unique(df_final$y))
+
+modXgboostParamas <- list("objective" = "multi:softprob",
+                   "eval_metric" = "mlogloss",
+                   "num_class" = noClasses)
+nround    <- 300 # number of XGBoost rounds
+# Fit cv.nfold * cv.nround XGB models and save OOF predictions
+modXgboost <- xgb.train(params = modXgboostParamas,
+                       data = train_matrix,
+                       nrounds = nround)
+```
+
+
+```{r Xgboost Validation}
+# Predict hold-out test set
+test_pred <- predict(modXgboost, newdata = test_matrix)
+test_prediction <- matrix(test_pred, nrow = noClasses,
+                          ncol=length(test_pred)/noClasses) %>%
+  t() %>%
+  data.frame() %>%
+  mutate(label = test_data_y + 1,
+         max_prob = max.col(., "last"))
+# confusion matrix of test set
+classeConfusionMatrixGBM <- confusionMatrix(factor(test_prediction$label),
+                factor(test_prediction$max_prob),
+                mode = "everything")
+
+plot(classeConfusionMatrixGBM$table, col = classeConfusionMatrixGBM$byClass, 
+     main = paste("GBM Accuracy =>",
+                  round(classeConfusionMatrixGBM$overall['Accuracy'], 4)))
+
+xgb_final <- predict(modXgboost, newdata = as.matrix(test_prep))
+
+
+df_xgb_final <- matrix(xgb_final, nrow = noClasses,
+                          ncol=length(xgb_final)/noClasses) %>%
+  t() %>%
+  data.frame() %>%
+  mutate(max_prob = max.col(., "last"))
+```
+
+Gradient boosting model has a 0.992 performance.
+
+### Modeling Conclusion
+
+Gradient boosting outperforms random forest, thus we will use it to predict the final class result.
+
+# Final prediction
+
+```{r}
+predRF <- predict(modRF, newdata=test_prep)
+predXgb <- df_xgb_final$max_prob
+predXgb = as.character(predXgb)
+predXgb[predXgb=='1'] <- 'A'
+predXgb[predXgb=='2'] <- 'B'
+predXgb[predXgb=='3'] <- 'C'
+predXgb[predXgb=='4'] <- 'D'
+predXgb[predXgb=='5'] <- 'E'
+
+df_results <- data.frame(rf = predRF, xgb = predXgb)
+df_results['equal'] <- df_results['rf'] == df_results['xgb']
+
+df_results
+```

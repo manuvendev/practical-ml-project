@@ -1,0 +1,13 @@
+base
+bitops
+RCurl
+xgboost
+dplyr
+lattice
+ggplot2
+caret
+reshape2
+foreach
+iterators
+doMC
+randomForest
